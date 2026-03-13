@@ -38,7 +38,7 @@ if __name__ == '__main__':
     chart = Chart(inner_width=1, inner_height=0.8)
     chart.time_scale(visible=False)
 
-    chart2 = chart.create_subchart(width=1, height=0.2, sync=True)
+    chart2 = chart.create_subchart(width=1, height=0.2, sync=True, sync_mode='main')
     line = chart2.create_line()
     
     df = pd.read_csv('ohlcv.csv')
@@ -46,6 +46,31 @@ if __name__ == '__main__':
 
     chart.set(df)
     line.set(df2)
+
+    chart.show(block=True)
+```
+___
+
+## Single DataFrame + Auto Indicator Panes
+
+```python
+import pandas as pd
+from lightweight_charts import Chart
+
+if __name__ == '__main__':
+    chart = Chart()
+
+    # columns: time, open, high, low, close, volume, rsi, atr, sma
+    df = pd.read_csv('ohlcv_indicators.csv')
+
+    chart.set(
+        df,
+        indicators={
+            'rsi': {'pane': 'osc', 'type': 'histogram'},
+            'atr': {'pane': 'osc', 'type': 'line'},
+            'sma': ['main', 'line'],
+        }
+    )
 
     chart.show(block=True)
 ```

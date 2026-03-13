@@ -6,8 +6,6 @@ import {
     IChartApi,
     ISeriesApi,
     LineStyleOptions,
-    LogicalRange,
-    LogicalRangeChangeEventHandler,
     MouseEventHandler,
     MouseEventParams,
     SeriesOptionsCommon,
@@ -214,82 +212,279 @@ export class Handler {
         return serialized;
     }
 
-    public static syncCharts(childChart:Handler, parentChart: Handler, crosshairOnly = false) {
-        function crosshairHandler(chart: Handler, point: any) {//point: BarData | LineData) {
-            if (!point) {
-                chart.chart.clearCrosshairPosition()
-                return
-            }
-            // TODO fix any point ?
-            chart.chart.setCrosshairPosition(point.value || point!.close, point.time, chart.series);
-            chart.legend.legendHandler(point, true)
-        }
-
-        function getPoint(series: ISeriesApi<SeriesType>, param: MouseEventParams) {
-            if (!param.time) return null;
-            return param.seriesData.get(series) || null;
-        }
-
+    public static syncCharts(
+        childChart: Handler,
+        parentChart: Handler,
+        crosshairOnly = false,
+        syncMode: 'main' | 'active' = 'main'
+    ) {
+        const mode = syncMode === 'active' ? 'active' : 'main'
         const childTimeScale = childChart.chart.timeScale();
         const parentTimeScale = parentChart.chart.timeScale();
 
-        const setChildRange = (timeRange: LogicalRange | null) => {
-            if(timeRange) childTimeScale.setVisibleLogicalRange(timeRange);
+        const syncRegistry: Map<string, () => void> =
+            (window as any).__syncRegistry || ((window as any).__syncRegistry = new Map<string, () => void>());
+        const syncKey = `${parentChart.id}::${childChart.id}`;
+        const previousDispose = syncRegistry.get(syncKey);
+        if (previousDispose) {
+            previousDispose();
+            syncRegistry.delete(syncKey);
         }
-        const setParentRange = (timeRange: LogicalRange | null) => {
-            if(timeRange) parentTimeScale.setVisibleLogicalRange(timeRange);
+
+        let isApplyingRange = false;
+        const disposers: Array<() => void> = [];
+        let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+        let syncWatchdog: ReturnType<typeof setInterval> | null = null;
+
+        function hasPrice(point: any) {
+            if (!point) return false;
+            const price = point.value ?? point.close;
+            if (price === undefined || price === null) return false;
+            return Number.isFinite(Number(price));
+        }
+
+        function getLogicalIndex(chart: Handler, time: Time): number | null {
+            const coordinate = chart.chart.timeScale().timeToCoordinate(time);
+            if (coordinate === null) return null;
+            const logical = chart.chart.timeScale().coordinateToLogical(coordinate);
+            if (logical === null) return null;
+            return logical.valueOf();
+        }
+
+        function getPointForTime(
+            chart: Handler,
+            time: Time
+        ): { series: ISeriesApi<SeriesType>, point: any } | null {
+            const index = getLogicalIndex(chart, time);
+            if (index === null) return null;
+
+            const mainPoint = chart.series.dataByIndex(index);
+            const mainVisible = (chart.series.options() as any).visible !== false;
+            if (mainVisible && hasPrice(mainPoint)) {
+                return { series: chart.series, point: mainPoint };
+            }
+
+            const series = [...chart._seriesList, chart.volumeSeries];
+            for (const candidate of series) {
+                const point = candidate.dataByIndex(index);
+                if (hasPrice(point)) {
+                    return { series: candidate, point };
+                }
+            }
+
+            if (hasPrice(mainPoint)) {
+                return { series: chart.series, point: mainPoint };
+            }
+            return null;
+        }
+
+        function getPointFromParam(chart: Handler, param: MouseEventParams) {
+            if (!param.time) return null;
+            const mainVisible = (chart.series.options() as any).visible !== false;
+            const candidates = [
+                ...(mainVisible ? [param.seriesData.get(chart.series)] : []),
+                ...chart._seriesList.map(series => param.seriesData.get(series)),
+                ...(!mainVisible ? [param.seriesData.get(chart.series)] : []),
+                param.seriesData.get(chart.volumeSeries),
+                ...Array.from(param.seriesData.values())
+            ];
+            for (const point of candidates) {
+                if (hasPrice(point)) {
+                    return {
+                        ...point,
+                        time: point.time ?? param.time,
+                    };
+                }
+            }
+            return null;
+        }
+
+        function crosshairHandler(chart: Handler, point: any) {
+            if (!point || !point.time) {
+                chart.chart.clearCrosshairPosition()
+                return
+            }
+            const pointAtTime = getPointForTime(chart, point.time);
+            if (!pointAtTime) {
+                chart.chart.clearCrosshairPosition()
+                return
+            }
+            const series = pointAtTime.series;
+            const pricePoint = pointAtTime.point;
+            const price = pricePoint.value ?? pricePoint.close;
+            const time = pricePoint.time ?? point.time;
+            if (price === undefined || price === null || !Number.isFinite(Number(price))) {
+                chart.chart.clearCrosshairPosition()
+                return
+            }
+            try {
+                chart.chart.setCrosshairPosition(Number(price), time, series);
+                chart.legend.legendHandler({ ...point, ...pricePoint, time }, true)
+            } catch (error) {
+                chart.chart.clearCrosshairPosition()
+            }
+        }
+
+        const syncChildToParentRange = () => {
+            if (isApplyingRange) return;
+            isApplyingRange = true;
+            const logicalRange = parentTimeScale.getVisibleLogicalRange();
+            if (logicalRange) {
+                childTimeScale.setVisibleLogicalRange(logicalRange);
+            } else {
+                const timeRange = parentTimeScale.getVisibleRange();
+                if (timeRange) childTimeScale.setVisibleRange(timeRange);
+            }
+            setTimeout(() => { isApplyingRange = false }, 0)
+        }
+        const setParentRange = (timeRange: { from: Time, to: Time } | null) => {
+            if (!timeRange || isApplyingRange) return;
+            isApplyingRange = true;
+            parentTimeScale.setVisibleRange(timeRange);
+            setTimeout(() => { isApplyingRange = false }, 0)
         }
 
         const setParentCrosshair = (param: MouseEventParams) => {
-            crosshairHandler(parentChart, getPoint(childChart.series, param))
+            crosshairHandler(parentChart, getPointFromParam(childChart, param))
         }
         const setChildCrosshair = (param: MouseEventParams) => {
-            crosshairHandler(childChart, getPoint(parentChart.series, param))
+            crosshairHandler(childChart, getPointFromParam(parentChart, param))
         }
 
-        let selected = parentChart
-        function addMouseOverListener(
-            thisChart: Handler,
-            otherChart: Handler,
-            thisCrosshair: MouseEventHandler<Time>,
-            otherCrosshair: MouseEventHandler<Time>,
-            thisRange: LogicalRangeChangeEventHandler,
-            otherRange: LogicalRangeChangeEventHandler)
-        {
-            thisChart.wrapper.addEventListener('mouseover', () => {
-                if (selected === thisChart) return
-                selected = thisChart
-                otherChart.chart.unsubscribeCrosshairMove(thisCrosshair)
-                thisChart.chart.subscribeCrosshairMove(otherCrosshair)
-                if (crosshairOnly) return;
-                otherChart.chart.timeScale().unsubscribeVisibleLogicalRangeChange(thisRange)
-                thisChart.chart.timeScale().subscribeVisibleLogicalRangeChange(otherRange)
+        let activeCrosshairSource: 'parent' | 'child' = 'parent';
+        const setActiveCrosshairSource = (source: 'parent' | 'child') => {
+            parentChart.chart.unsubscribeCrosshairMove(setChildCrosshair)
+            childChart.chart.unsubscribeCrosshairMove(setParentCrosshair)
+            if (source === 'parent') {
+                parentChart.chart.subscribeCrosshairMove(setChildCrosshair)
+            } else {
+                childChart.chart.subscribeCrosshairMove(setParentCrosshair)
+            }
+            activeCrosshairSource = source
+        }
+        setActiveCrosshairSource('parent')
+        disposers.push(() => {
+            parentChart.chart.unsubscribeCrosshairMove(setChildCrosshair)
+            childChart.chart.unsubscribeCrosshairMove(setParentCrosshair)
+        })
+
+        syncChildToParentRange()
+
+        let setActiveRangeSource: ((source: 'parent' | 'child') => void) | null = null;
+        if (!crosshairOnly && mode === 'active') {
+            let activeRangeSource: 'parent' | 'child' = 'parent';
+            setActiveRangeSource = (source: 'parent' | 'child') => {
+                parentTimeScale.unsubscribeVisibleTimeRangeChange(syncChildToParentRange)
+                childTimeScale.unsubscribeVisibleTimeRangeChange(setParentRange)
+                if (source === 'parent') {
+                    parentTimeScale.subscribeVisibleTimeRangeChange(syncChildToParentRange)
+                } else {
+                    childTimeScale.subscribeVisibleTimeRangeChange(setParentRange)
+                }
+                activeRangeSource = source
+            }
+            setActiveRangeSource('parent')
+            disposers.push(() => {
+                parentTimeScale.unsubscribeVisibleTimeRangeChange(syncChildToParentRange)
+                childTimeScale.unsubscribeVisibleTimeRangeChange(setParentRange)
             })
         }
-        addMouseOverListener(
-            parentChart,
-            childChart,
-            setParentCrosshair,
-            setChildCrosshair,
-            setParentRange,
-            setChildRange
-        )
-        addMouseOverListener(
-            childChart,
-            parentChart,
-            setChildCrosshair,
-            setParentCrosshair,
-            setChildRange,
-            setParentRange
-        )
 
-        parentChart.chart.subscribeCrosshairMove(setChildCrosshair)
+        if (mode === 'active') {
+            const onParentMouseOver = () => {
+                if (activeCrosshairSource !== 'parent') setActiveCrosshairSource('parent')
+                if (setActiveRangeSource) setActiveRangeSource('parent')
+            }
+            const onChildMouseOver = () => {
+                if (activeCrosshairSource !== 'child') setActiveCrosshairSource('child')
+                if (setActiveRangeSource) setActiveRangeSource('child')
+            }
+            parentChart.wrapper.addEventListener('mouseover', onParentMouseOver)
+            childChart.wrapper.addEventListener('mouseover', onChildMouseOver)
+            disposers.push(() => parentChart.wrapper.removeEventListener('mouseover', onParentMouseOver))
+            disposers.push(() => childChart.wrapper.removeEventListener('mouseover', onChildMouseOver))
+        }
 
-        const parentRange = parentTimeScale.getVisibleLogicalRange()
-        if (parentRange) childTimeScale.setVisibleLogicalRange(parentRange)
+        if (crosshairOnly) {
+            const dispose = () => {
+                for (const teardown of disposers) teardown()
+                if (resizeTimer) clearTimeout(resizeTimer)
+                syncRegistry.delete(syncKey)
+            }
+            syncRegistry.set(syncKey, dispose)
+            return;
+        }
 
-        if (crosshairOnly) return;
-        parentChart.chart.timeScale().subscribeVisibleLogicalRangeChange(setChildRange)
+        if (mode === 'active') {
+            const dispose = () => {
+                for (const teardown of disposers) teardown()
+                if (resizeTimer) clearTimeout(resizeTimer)
+                syncRegistry.delete(syncKey)
+            }
+            syncRegistry.set(syncKey, dispose)
+            return;
+        }
+
+        const onParentRangeChange = () => syncChildToParentRange()
+        const onChildRangeChange = () => syncChildToParentRange()
+
+        parentTimeScale.subscribeVisibleLogicalRangeChange(onParentRangeChange)
+        parentTimeScale.subscribeVisibleTimeRangeChange(onParentRangeChange)
+        childTimeScale.subscribeVisibleLogicalRangeChange(onChildRangeChange)
+        childTimeScale.subscribeVisibleTimeRangeChange(onChildRangeChange)
+        disposers.push(() => {
+            parentTimeScale.unsubscribeVisibleLogicalRangeChange(onParentRangeChange)
+            parentTimeScale.unsubscribeVisibleTimeRangeChange(onParentRangeChange)
+            childTimeScale.unsubscribeVisibleLogicalRangeChange(onChildRangeChange)
+            childTimeScale.unsubscribeVisibleTimeRangeChange(onChildRangeChange)
+        })
+
+        const onResize = () => {
+            if (resizeTimer) clearTimeout(resizeTimer)
+            resizeTimer = setTimeout(() => {
+                syncChildToParentRange()
+                setTimeout(() => syncChildToParentRange(), 0)
+                setTimeout(() => syncChildToParentRange(), 16)
+            }, 0)
+        }
+        window.addEventListener('resize', onResize)
+        disposers.push(() => {
+            window.removeEventListener('resize', onResize)
+            if (resizeTimer) clearTimeout(resizeTimer)
+        })
+
+        const rangesOutOfSync = () => {
+            const parentLogical = parentTimeScale.getVisibleLogicalRange()
+            const childLogical = childTimeScale.getVisibleLogicalRange()
+            if (parentLogical && childLogical) {
+                const eps = 1e-6
+                return (
+                    Math.abs(parentLogical.from - childLogical.from) > eps
+                    || Math.abs(parentLogical.to - childLogical.to) > eps
+                )
+            }
+
+            const parentRange = parentTimeScale.getVisibleRange()
+            const childRange = childTimeScale.getVisibleRange()
+            if (!parentRange || !childRange) return false
+            return JSON.stringify(parentRange) !== JSON.stringify(childRange)
+        }
+
+        syncWatchdog = setInterval(() => {
+            if (isApplyingRange) return
+            if (rangesOutOfSync()) syncChildToParentRange()
+        }, 120)
+        disposers.push(() => {
+            if (syncWatchdog) clearInterval(syncWatchdog)
+            syncWatchdog = null
+        })
+
+        const dispose = () => {
+            for (const teardown of disposers) teardown()
+            if (resizeTimer) clearTimeout(resizeTimer)
+            syncRegistry.delete(syncKey)
+        }
+        syncRegistry.set(syncKey, dispose)
     }
 
     public static makeSearchBox(chart: Handler) {

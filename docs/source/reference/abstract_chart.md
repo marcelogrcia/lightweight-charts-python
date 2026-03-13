@@ -8,7 +8,7 @@ ___
 
 
 
-```{py:method} set(data: pd.DataFrame, keep_drawings: bool = False)
+```{py:method} set(data: pd.DataFrame, keep_drawings: bool = False, indicators: dict = None, engine: str = 'pandas', engine_options: dict = None)
 Sets the initial data for the chart.
 
 
@@ -19,9 +19,52 @@ Time can be given in the index rather than a column, and volume can be omitted i
 
 If `keep_drawings` is `True`, any drawings made using the `toolbox` will be redrawn with the new data. This is designed to be used when switching to a different timeframe of the same symbol.
 
+`indicators` can be used to map indicator columns to main chart or subplots:
+: `{'rsi': ['subplot', 'histogram'], 'sma': ['main', 'line']}`
+
+You can also use dict format to group multiple indicators into one pane:
+: `{'rsi': {'pane': 'osc', 'type': 'line'}, 'atr': {'pane': 'osc', 'type': 'histogram'}}`
+
+`engine='duckdb'` enables internal streaming mode for very large datasets.
+: It materializes temporary internal parquet/db artifacts and fetches by visible range.
+: Dynamic fetch-on-pan requires a callback-enabled backend (`Chart`, `QtChart`, `WxChart`). In static backends (e.g. `JupyterChart`), only the latest window is loaded.
+
+`engine_options` can tune internal streaming behavior.
+: Supported keys: `initial_bars`, `chunk_bars`, `prefetch_bars`, `max_bars`, `debounce_ms`, `keep_drawings`.
+
 `None` can also be given, which will erase all candle and volume data displayed on the chart.
 
 You can also add columns to color the candles (https://tradingview.github.io/lightweight-charts/tutorials/customization/data-points)
+```
+
+```{py:method} set_stream(source: pd.DataFrame | StreamingSource, indicators: dict = None, initial_bars: int = 2000, chunk_bars: int = 1200, prefetch_bars: int = 300, max_bars: int = 20000, debounce_ms: int = 80, keep_drawings: bool = True)
+Enables internal windowed streaming for large datasets.
+
+`source`
+: can be a `DataFrame`, `PandasSource`, or `DuckDBSource`.
+
+`initial_bars`
+: number of bars loaded initially.
+
+`chunk_bars`
+: number of bars fetched each time the visible range approaches either edge.
+
+`prefetch_bars`
+: threshold in bars before an edge where the next fetch is triggered.
+
+`max_bars`
+: maximum bars kept in-memory/rendered at once.
+
+`debounce_ms`
+: debounce for visible-range events before requesting more data.
+```
+
+```{py:method} stop_stream()
+Disables the internal streaming listener for the chart.
+```
+
+```{py:method} reset(keep_drawings: bool = False)
+Clears all chart data and indicators, stops internal streaming, and removes temporary artifacts created by `engine='duckdb'`.
 ```
 
 
@@ -335,7 +378,7 @@ ___
 
 
 
-````{py:method} create_subchart(position: FLOAT, width: float, height: float, sync: bool | str, sync_crosshairs_only: bool, scale_candles_only: bool, toolbox: bool) -> AbstractChart 
+````{py:method} create_subchart(position: FLOAT, width: float, height: float, sync: bool | str, scale_candles_only: bool, sync_crosshairs_only: bool, sync_mode: str = 'main', toolbox: bool) -> AbstractChart 
 
 Creates and returns a Chart object, placing it adjacent to the previous Chart. This allows for the use of multiple chart panels within the same window.
 
@@ -346,10 +389,13 @@ Creates and returns a Chart object, placing it adjacent to the previous Chart. T
 : Specifies the size of the Subchart, where `1` is the width/height of the window (100%)
 
 `sync`
-: If given as `True`, the Subchart's timescale and crosshair will follow that of the declaring Chart. If a `str` is passed, the Chart will follow the panel with the given id.  Chart ids  can be accessed from the `chart.id` attribute. 
+: If given as `True`, the Subchart follows the declaring Chart (OHLC panel) by default. If a `str` is passed, the Chart will follow the panel with the given id. Chart ids can be accessed from the `chart.id` attribute.
 
 `sync_crosshairs_only`
 : If given as `True`, only the crosshairs will be synced and movement will remain independant.
+
+`sync_mode`
+: `'main'` keeps the declaring chart as the master for timescale sync. `'active'` uses the currently hovered chart as the sync source.
 
 ```{important}
 `width` and `height` should be given as a number between 0 and 1.
@@ -365,10 +411,6 @@ Price axis scales vary depending on the precision of the data used, and there is
 
 ````
 `````
-
-
-
-
 
 
 

@@ -158,9 +158,9 @@ export class Legend {
         if (usingPoint) {
             const timeScale = this.handler.chart.timeScale();
             let coordinate = timeScale.timeToCoordinate(param.time)
-            if (coordinate)
+            if (coordinate !== null)
             logical = timeScale.coordinateToLogical(coordinate.valueOf())
-            if (logical)
+            if (logical !== null)
             data = this.handler.series.dataByIndex(logical.valueOf())
         }
         else {
@@ -191,13 +191,13 @@ export class Legend {
 
             if (this.handler.volumeSeries) {
                 let volumeData: any;
-                if (logical) {
-                    volumeData = this.handler.volumeSeries.dataByIndex(logical)
+                if (logical !== null) {
+                    volumeData = this.handler.volumeSeries.dataByIndex(logical.valueOf())
                 }
                 else {
                     volumeData = param.seriesData.get(this.handler.volumeSeries)
                 }
-                if (volumeData) {
+                if (volumeData && volumeData.value !== undefined && volumeData.value !== null) {
                     str += this.ohlcEnabled ? `<br>V ${this.shorthandFormat(volumeData.value)}` : ''
                 }
             }
@@ -212,13 +212,13 @@ export class Legend {
             e.row.style.display = 'flex'
 
             let data
-            if (usingPoint && logical) {
-                data = e.series.dataByIndex(logical) as LineData
+            if (usingPoint && logical !== null) {
+                data = e.series.dataByIndex(logical.valueOf()) as LineData
             }
             else {
                 data = param.seriesData.get(e.series) as LineData
             }
-            if (!data?.value) return;
+            if (data?.value === undefined || data.value === null || Number.isNaN(Number(data.value))) return;
             let price;
             if (e.series.seriesType() == 'Histogram') {
                 price = this.shorthandFormat(data.value)

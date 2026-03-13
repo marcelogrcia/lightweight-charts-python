@@ -2,6 +2,7 @@ import asyncio
 import json
 import multiprocessing as mp
 import typing
+import warnings
 import webview
 from webview.errors import JavascriptException
 
@@ -199,7 +200,24 @@ class Chart(abstract.AbstractChart):
         else:
             Chart.WV.show(self._i)
         if block:
-            asyncio.run(self.show_async())
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                asyncio.run(self.show_async())
+                return None
+
+            current_task = getattr(self, '_show_async_task', None)
+            if current_task and not current_task.done():
+                return current_task
+
+            warnings.warn(
+                'Chart.show(block=True) was called inside an active event loop. '
+                'Starting chart listener as a background task; use await chart.show_async() '
+                'for notebook-friendly blocking behavior.',
+                RuntimeWarning,
+            )
+            self._show_async_task = loop.create_task(self.show_async())
+            return self._show_async_task
 
     async def show_async(self):
         self.show(block=False)
@@ -226,11 +244,12 @@ class Chart(abstract.AbstractChart):
         """
         Hides the chart window.\n
         """
-        self._q.put((self._i, 'hide'))
+        Chart.WV.hide(self._i)
 
     def exit(self):
         """
         Exits and destroys the chart window.\n
         """
+        self.reset(keep_drawings=True)
         Chart.WV.exit()
         self.is_alive = False

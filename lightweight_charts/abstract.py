@@ -1,9 +1,13 @@
 import asyncio
 import json
 import os
+import shutil
+import tempfile
+import warnings
 from base64 import b64decode
 from datetime import datetime
-from typing import Callable, Union, Literal, List, Optional
+from pathlib import Path
+from typing import Callable, Union, Literal, List, Optional, Dict, Any
 import pandas as pd
 
 from .table import Table
@@ -15,6 +19,7 @@ from .util import (
     LINE_STYLE, MARKER_POSITION, MARKER_SHAPE, CROSSHAIR_MODE,
     PRICE_SCALE_MODE, marker_position, marker_shape, js_data,
 )
+from .streaming import StreamingSource, PandasSource, DuckDBSource, StreamConfig
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 INDEX = os.path.join(current_dir, 'js', 'index.html')
@@ -104,6 +109,7 @@ class Window:
         sync_id: Optional[str] = None,
         scale_candles_only: bool = False,
         sync_crosshairs_only: bool = False,
+        sync_mode: Literal['main', 'active'] = 'main',
         toolbox: bool = False
     ) -> 'AbstractChart':
         subchart = AbstractChart(
@@ -120,7 +126,8 @@ class Window:
             Lib.Handler.syncCharts(
                 {subchart.id},
                 {sync_id},
-                {jbool(sync_crosshairs_only)}
+                {jbool(sync_crosshairs_only)},
+                "{sync_mode}"
             )
         ''', run_last=True)
         return subchart
@@ -154,9 +161,56 @@ class SeriesCommon(Pane):
         self.data = pd.DataFrame()
         self.markers = {}
 
+    @staticmethod
+    def _infer_epoch_unit(max_abs_value: float) -> str:
+        if max_abs_value >= 1e17:
+            return 'ns'
+        if max_abs_value >= 1e14:
+            return 'us'
+        if max_abs_value >= 1e11:
+            return 'ms'
+        return 's'
+
+    @classmethod
+    def _numeric_to_datetime(cls, values: pd.Series) -> pd.Series:
+        values = pd.to_numeric(values, errors='coerce')
+        non_null = values.dropna()
+        if non_null.empty:
+            return pd.to_datetime(values, errors='coerce')
+        unit = cls._infer_epoch_unit(float(non_null.abs().max()))
+        return pd.to_datetime(values, unit=unit, errors='coerce')
+
+    @classmethod
+    def _to_datetime_series(cls, values: pd.Series) -> pd.Series:
+        if pd.api.types.is_datetime64_any_dtype(values):
+            return pd.to_datetime(values, errors='coerce')
+        if pd.api.types.is_numeric_dtype(values):
+            return cls._numeric_to_datetime(values)
+
+        numeric_values = pd.to_numeric(values, errors='coerce')
+        non_null_count = int(values.notna().sum())
+        numeric_ratio = (float(numeric_values.notna().sum()) / non_null_count) if non_null_count else 0.0
+        if numeric_ratio >= 0.9 and numeric_values.notna().any():
+            return cls._numeric_to_datetime(numeric_values)
+        return pd.to_datetime(values, errors='coerce')
+
+    @classmethod
+    def _to_datetime_scalar(cls, value):
+        if isinstance(value, pd.Timestamp):
+            return value
+        if isinstance(value, (int, float)) and not pd.isna(value):
+            unit = cls._infer_epoch_unit(abs(float(value)))
+            return pd.to_datetime(value, unit=unit, errors='coerce')
+        if isinstance(value, str):
+            numeric_value = pd.to_numeric(pd.Series([value]), errors='coerce').iloc[0]
+            if not pd.isna(numeric_value):
+                unit = cls._infer_epoch_unit(abs(float(numeric_value)))
+                return pd.to_datetime(float(numeric_value), unit=unit, errors='coerce')
+        return pd.to_datetime(value, errors='coerce')
+
     def _set_interval(self, df: pd.DataFrame):
         if not pd.api.types.is_datetime64_any_dtype(df['time']):
-            df['time'] = pd.to_datetime(df['time'])
+            df['time'] = self._to_datetime_series(df['time'])
         common_interval = df['time'].diff().value_counts()
         if common_interval.empty:
             return
@@ -197,9 +251,18 @@ class SeriesCommon(Pane):
     def _df_datetime_format(self, df: pd.DataFrame, exclude_lowercase=None):
         df = df.copy()
         df.columns = self._format_labels(df, df.columns, df.index, exclude_lowercase)
-        self._set_interval(df)
         if not pd.api.types.is_datetime64_any_dtype(df['time']):
-            df['time'] = pd.to_datetime(df['time'])
+            df['time'] = self._to_datetime_series(df['time'])
+        df = df.dropna(subset=['time'])
+        if df.empty:
+            return df
+        df = (
+            df
+            .sort_values('time')
+            .drop_duplicates(subset=['time'], keep='last')
+            .reset_index(drop=True)
+        )
+        self._set_interval(df)
         df['time'] = df['time'].astype('int64') // 10 ** 9
         return df
 
@@ -211,10 +274,9 @@ class SeriesCommon(Pane):
 
     def _single_datetime_format(self, arg) -> float:
         if isinstance(arg, (str, int, float)) or not pd.api.types.is_datetime64_any_dtype(arg):
-            try:
-                arg = pd.to_datetime(arg, unit='ms')
-            except ValueError:
-                arg = pd.to_datetime(arg)
+            arg = self._to_datetime_scalar(arg)
+        if pd.isna(arg):
+            raise ValueError('Could not parse time value.')
         arg = self._interval * (arg.timestamp() // self._interval)+self.offset
         return arg
 
@@ -225,6 +287,10 @@ class SeriesCommon(Pane):
             return
         if format_cols:
             df = self._df_datetime_format(df, exclude_lowercase=self.name)
+            if df.empty:
+                self.run_script(f'{self.id}.series.setData([])')
+                self.data = pd.DataFrame()
+                return
         if self.name:
             if self.name not in df:
                 raise NameError(f'No column named "{self.name}".')
@@ -539,33 +605,399 @@ class Candlestick(SeriesCommon):
 
         # self.run_script(f'{self.id}.makeCandlestickSeries()')
 
-    def set(self, df: Optional[pd.DataFrame] = None, keep_drawings=False):
+    @staticmethod
+    def _normalize_indicator_type(series_type: str) -> str:
+        normalized = series_type.strip().lower()
+        if normalized == 'hist':
+            normalized = 'histogram'
+        if normalized not in ('line', 'histogram'):
+            raise ValueError(f'Invalid indicator type "{series_type}". Use "line" or "histogram".')
+        return normalized
+
+    @staticmethod
+    def _normalize_indicators_spec(indicators: Optional[dict]) -> Dict[str, Dict[str, str]]:
+        if indicators is None:
+            return {}
+        if not isinstance(indicators, dict):
+            raise TypeError('indicators must be a dict.')
+
+        normalized: Dict[str, Dict[str, str]] = {}
+        for column, spec in indicators.items():
+            if not isinstance(column, str):
+                raise TypeError('Indicator names must be strings.')
+            if isinstance(spec, (list, tuple)):
+                if len(spec) != 2:
+                    raise ValueError(f'Indicator "{column}" list format must be [pane, type].')
+                pane, series_type = spec
+            elif isinstance(spec, dict):
+                pane = spec.get('pane', 'main')
+                series_type = spec.get('type', 'line')
+            else:
+                raise TypeError(
+                    f'Indicator "{column}" spec must be [pane, type] or dict with pane/type keys.'
+                )
+
+            if not isinstance(pane, str):
+                raise TypeError(f'Indicator "{column}" pane must be a string.')
+            if not isinstance(series_type, str):
+                raise TypeError(f'Indicator "{column}" type must be a string.')
+
+            pane_value = pane.strip()
+            if not pane_value:
+                raise ValueError(f'Indicator "{column}" pane cannot be empty.')
+
+            pane_lower = pane_value.lower()
+            if pane_lower == 'main':
+                pane_key = 'main'
+            elif pane_lower == 'subplot':
+                pane_key = f'subplot:{column}'
+            else:
+                pane_key = f'pane:{pane_lower}'
+
+            normalized[column] = {
+                'pane': pane_value,
+                'pane_key': pane_key,
+                'type': Candlestick._normalize_indicator_type(series_type),
+            }
+        return normalized
+
+    def _get_or_create_indicator_chart(self, pane_key: str) -> 'AbstractChart':
+        if pane_key == 'main':
+            return self
+        pane_chart = self._indicator_panes.get(pane_key)
+        if pane_chart is None:
+            indicator_chart = self.create_subchart(
+                width=1.0,
+                height=0.2,
+                sync=True,
+                sync_mode='main'
+            )
+            indicator_chart.legend(visible=True, ohlc=False, percent=False, lines=True)
+            indicator_chart.hide_data()
+            indicator_chart.crosshair(horz_visible=False)
+            indicator_chart.run_script(f'{indicator_chart.id}.chart.applyOptions({{handleScroll: false, handleScale: false}})')
+            self._indicator_panes[pane_key] = indicator_chart
+            pane_chart = indicator_chart
+        if pane_key not in self._auto_indicator_pane_keys:
+            self._auto_indicator_pane_keys.append(pane_key)
+            self._rebalance_auto_indicator_panes()
+        return pane_chart
+
+    def _rebalance_auto_indicator_panes(self):
+        pane_count = len(self._auto_indicator_pane_keys)
+        if pane_count == 0:
+            return
+
+        preferred_pane_height = 0.2
+        preferred_main_height = 1 - (pane_count * preferred_pane_height)
+        main_height = max(0.2, preferred_main_height)
+        pane_height = (1 - main_height) / pane_count
+
+        self.resize(height=main_height)
+        for pane_key in self._auto_indicator_pane_keys:
+            pane_chart = self._indicator_panes.get(pane_key)
+            if pane_chart is None:
+                continue
+            pane_chart.resize(height=pane_height)
+
+    def _create_indicator_series(
+        self,
+        pane_chart: 'AbstractChart',
+        column: str,
+        series_type: str
+    ) -> Union['Line', 'Histogram']:
+        if series_type == 'line':
+            return pane_chart.create_line(name=column, price_line=False, price_label=False)
+        return pane_chart.create_histogram(name=column, price_line=False, price_label=False)
+
+    def _set_indicator_pane_timeline(self, pane_chart: 'AbstractChart', df: pd.DataFrame):
+        timeline = df[['time']].copy()
+        timeline['open'] = 0.0
+        timeline['high'] = 0.0
+        timeline['low'] = 0.0
+        timeline['close'] = 0.0
+        pane_chart.run_script(f'{pane_chart.id}.series.setData({js_data(timeline)})')
+        pane_chart.run_script(f'{pane_chart.id}.volumeSeries.setData([])')
+
+    @staticmethod
+    def _sanitize_ohlc_rows(df: pd.DataFrame) -> Optional[pd.Series]:
+        ohlc_cols = ['open', 'high', 'low', 'close']
+        if any(col not in df.columns for col in ohlc_cols):
+            return None
+        valid_mask = df[ohlc_cols].notna().all(axis=1)
+        if not bool(valid_mask.all()):
+            df.loc[~valid_mask, ohlc_cols] = pd.NA
+        return valid_mask
+
+    def _apply_indicators(
+        self,
+        df: pd.DataFrame,
+        indicators: Optional[dict],
+        valid_ohlc_mask: Optional[pd.Series] = None
+    ):
+        if indicators is None:
+            return
+        normalized = self._normalize_indicators_spec(indicators)
+        resolved: Dict[str, Dict[str, str]] = {}
+        for indicator, spec in normalized.items():
+            resolved_name = (
+                indicator
+                if indicator in df.columns
+                else indicator.lower() if indicator.lower() in df.columns else None
+            )
+            if resolved_name is None:
+                raise NameError(f'No column named "{indicator}" for indicators.')
+            resolved[resolved_name] = spec
+
+        active_indicators = set(resolved)
+        for indicator in list(self._indicator_series):
+            if indicator in active_indicators:
+                continue
+            self._indicator_series[indicator]['series'].delete()
+            del self._indicator_series[indicator]
+
+        timeline_synced_panes = set()
+
+        for indicator, spec in resolved.items():
+            existing = self._indicator_series.get(indicator)
+            needs_recreate = (
+                existing is None
+                or existing['pane_key'] != spec['pane_key']
+                or existing['type'] != spec['type']
+            )
+            if needs_recreate:
+                if existing is not None:
+                    existing['series'].delete()
+                pane_chart = self._get_or_create_indicator_chart(spec['pane_key'])
+                indicator_series = self._create_indicator_series(pane_chart, indicator, spec['type'])
+                self._indicator_series[indicator] = {
+                    'series': indicator_series,
+                    'pane_key': spec['pane_key'],
+                    'type': spec['type'],
+                }
+            pane_key = self._indicator_series[indicator]['pane_key']
+            if pane_key != 'main' and pane_key not in timeline_synced_panes:
+                pane_chart = self._indicator_series[indicator]['series']._chart
+                self._set_indicator_pane_timeline(pane_chart, df)
+                timeline_synced_panes.add(pane_key)
+            indicator_df = df[['time', indicator]].copy()
+            if valid_ohlc_mask is not None:
+                indicator_df.loc[~valid_ohlc_mask, indicator] = pd.NA
+            self._indicator_series[indicator]['series'].set(
+                indicator_df,
+                format_cols=False
+            )
+
+        active_pane_keys = {
+            meta['pane_key']
+            for meta in self._indicator_series.values()
+            if meta['pane_key'] != 'main'
+        }
+        removed_panes = [pane_key for pane_key in self._auto_indicator_pane_keys if pane_key not in active_pane_keys]
+        for pane_key in removed_panes:
+            pane_chart = self._indicator_panes.get(pane_key)
+            if pane_chart is not None:
+                pane_chart.run_script(f'{pane_chart.id}.series.setData([])')
+                pane_chart.run_script(f'{pane_chart.id}.volumeSeries.setData([])')
+                pane_chart.resize(height=0)
+            while pane_key in self._auto_indicator_pane_keys:
+                self._auto_indicator_pane_keys.remove(pane_key)
+        if removed_panes:
+            if self._auto_indicator_pane_keys:
+                self._rebalance_auto_indicator_panes()
+            else:
+                self.resize(height=1.0)
+
+    def _normalize_df_for_engine(self, df: pd.DataFrame) -> pd.DataFrame:
+        normalized = df.copy()
+        normalized.columns = self._format_labels(normalized, normalized.columns, normalized.index, None)
+        if 'time' not in normalized.columns:
+            raise NameError('No "time" or "date" column found for engine-backed set().')
+        if not pd.api.types.is_datetime64_any_dtype(normalized['time']):
+            normalized['time'] = self._to_datetime_series(normalized['time'])
+        return (
+            normalized
+            .sort_values('time')
+            .drop_duplicates(subset=['time'], keep='last')
+            .reset_index(drop=True)
+        )
+
+    def _cleanup_engine_artifacts(self):
+        for artifact_dir in self._engine_artifact_dirs:
+            shutil.rmtree(artifact_dir, ignore_errors=True)
+        self._engine_artifact_dirs.clear()
+
+    def _create_internal_duckdb_source(self, df: pd.DataFrame) -> DuckDBSource:
+        try:
+            import duckdb  # type: ignore
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                'duckdb is required for engine="duckdb". Install with: pip install duckdb'
+            ) from exc
+
+        self._cleanup_engine_artifacts()
+        normalized = self._normalize_df_for_engine(df)
+        artifact_dir = Path(tempfile.mkdtemp(prefix='lwc_duckdb_'))
+        parquet_path = artifact_dir / 'dataset.parquet'
+        db_path = artifact_dir / 'dataset.duckdb'
+
+        con = duckdb.connect(database=str(db_path))
+        try:
+            con.register('src_df', normalized)
+            con.execute('CREATE TABLE candles AS SELECT * FROM src_df')
+            safe_path = str(parquet_path).replace("'", "''")
+            con.execute(f"COPY candles TO '{safe_path}' (FORMAT PARQUET)")
+        finally:
+            con.close()
+
+        self._engine_artifact_dirs.append(str(artifact_dir))
+        return DuckDBSource(
+            database=str(db_path),
+            table='candles',
+            time_col='time',
+            time_unit='timestamp',
+        )
+
+    def reset(self, keep_drawings: bool = False):
+        self.stop_stream()
+        self._cleanup_engine_artifacts()
+
+        self.candle_data = pd.DataFrame()
+        self.data = pd.DataFrame()
+        self._last_bar = None
+
+        self.run_script(f'{self.id}.series.setData([])')
+        self.run_script(f'{self.id}.volumeSeries.setData([])')
+
+        for line in self._lines:
+            line.set(pd.DataFrame())
+
+        for indicator in list(self._indicator_series):
+            self._indicator_series[indicator]['series'].delete()
+            del self._indicator_series[indicator]
+
+        for pane_chart in self._indicator_panes.values():
+            pane_chart.run_script(f'{pane_chart.id}.series.setData([])')
+            pane_chart.run_script(f'{pane_chart.id}.volumeSeries.setData([])')
+            pane_chart.resize(height=0)
+        self._auto_indicator_pane_keys.clear()
+        self.resize(height=1.0)
+
+        if keep_drawings:
+            self.run_script(f'{self._chart.id}.toolBox?._drawingTool.repositionOnTime()')
+        else:
+            self.run_script(f"{self._chart.id}.toolBox?.clearDrawings()")
+
+    def set(
+        self,
+        df: Optional[pd.DataFrame] = None,
+        keep_drawings: bool = False,
+        indicators: Optional[dict] = None,
+        engine: Optional[Literal['pandas', 'duckdb']] = None,
+        engine_options: Optional[dict] = None,
+        _from_stream: bool = False,
+        render_drawings: Optional[bool] = None,
+    ):
         """
         Sets the initial data for the chart.\n
         :param df: columns: date/time, open, high, low, close, volume (if volume enabled).
         :param keep_drawings: keeps any drawings made through the toolbox. Otherwise, they will be deleted.
+        :param indicators: optional indicator spec mapping indicator column to pane/type.
+        :param engine: optional backend for large datasets (`duckdb` enables internal streaming).
+        :param engine_options: optional streaming options for engine mode.
         """
+        if render_drawings is not None:
+            keep_drawings = bool(render_drawings)
+
+        selected_engine = (engine or 'pandas').strip().lower()
+        if selected_engine not in ('pandas', 'duckdb'):
+            raise ValueError('engine must be "pandas" or "duckdb".')
+
+        if not _from_stream and selected_engine != 'duckdb':
+            self.stop_stream()
+            self._cleanup_engine_artifacts()
+
+        if selected_engine == 'duckdb' and not _from_stream:
+            if df is None or df.empty:
+                self.reset(keep_drawings=keep_drawings)
+                return
+            options = engine_options.copy() if engine_options else {}
+            unknown_option_keys = sorted(
+                set(options.keys()) - {'initial_bars', 'chunk_bars', 'prefetch_bars', 'max_bars', 'debounce_ms', 'keep_drawings'}
+            )
+            if unknown_option_keys:
+                unknown_options = ', '.join(unknown_option_keys)
+                raise ValueError(f'Unknown engine_options for engine="duckdb": {unknown_options}')
+            self.stop_stream()
+            source = self._create_internal_duckdb_source(df)
+            initial_bars = int(options.pop('initial_bars', 2000))
+            chunk_bars = int(options.pop('chunk_bars', 1200))
+            prefetch_bars = int(options.pop('prefetch_bars', 300))
+            max_bars = int(options.pop('max_bars', 20000))
+            debounce_ms = int(options.pop('debounce_ms', 80))
+            stream_keep_drawings = bool(options.pop('keep_drawings', keep_drawings))
+
+            # Static backends (e.g., Jupyter iframe) have no JS->Python callback bridge.
+            if self.win.script_func is None:
+                initial_df = source.get_latest(initial_bars)
+                source.close()
+                self.set(
+                    initial_df,
+                    keep_drawings=stream_keep_drawings,
+                    indicators=indicators,
+                    _from_stream=True,
+                )
+                warnings.warn(
+                    'engine="duckdb" loaded only the latest window because this chart backend '
+                    'does not support JS callbacks for dynamic streaming.',
+                    RuntimeWarning,
+                )
+                return
+
+            self.set_stream(
+                source=source,
+                indicators=indicators,
+                initial_bars=initial_bars,
+                chunk_bars=chunk_bars,
+                prefetch_bars=prefetch_bars,
+                max_bars=max_bars,
+                debounce_ms=debounce_ms,
+                keep_drawings=stream_keep_drawings,
+            )
+            return
+
         if df is None or df.empty:
             self.run_script(f'{self.id}.series.setData([])')
             self.run_script(f'{self.id}.volumeSeries.setData([])')
             self.candle_data = pd.DataFrame()
             return
         df = self._df_datetime_format(df)
+        if df.empty:
+            self.run_script(f'{self.id}.series.setData([])')
+            self.run_script(f'{self.id}.volumeSeries.setData([])')
+            self.candle_data = pd.DataFrame()
+            return
+        valid_ohlc_mask = self._sanitize_ohlc_rows(df)
         self.candle_data = df.copy()
         self._last_bar = df.iloc[-1]
         self.run_script(f'{self.id}.series.setData({js_data(df)})')
 
-        if 'volume' not in df:
-            return
-        volume = df.drop(columns=['open', 'high', 'low', 'close']).rename(columns={'volume': 'value'})
-        volume['color'] = self._volume_down_color
-        volume.loc[df['close'] > df['open'], 'color'] = self._volume_up_color
-        self.run_script(f'{self.id}.volumeSeries.setData({js_data(volume)})')
+        if 'volume' in df:
+            volume = df.drop(columns=['open', 'high', 'low', 'close']).rename(columns={'volume': 'value'})
+            if valid_ohlc_mask is not None:
+                volume.loc[~valid_ohlc_mask, 'value'] = pd.NA
+            volume['color'] = self._volume_down_color
+            volume.loc[df['close'] > df['open'], 'color'] = self._volume_up_color
+            volume.loc[volume['value'].isna(), 'color'] = None
+            self.run_script(f'{self.id}.volumeSeries.setData({js_data(volume)})')
+        else:
+            self.run_script(f'{self.id}.volumeSeries.setData([])')
 
         for line in self._lines:
             if line.name not in df.columns:
                 continue
             line.set(df[['time', line.name]], format_cols=False)
+        self._apply_indicators(df, indicators, valid_ohlc_mask=valid_ohlc_mask)
         # set autoScale to true in case the user has dragged the price scale
         self.run_script(f'''
             if (!{self.id}.chart.priceScale("right").options.autoScale)
@@ -576,6 +1008,169 @@ class Candlestick(SeriesCommon):
             self.run_script(f'{self._chart.id}.toolBox?._drawingTool.repositionOnTime()')
         else:
             self.run_script(f"{self._chart.id}.toolBox?.clearDrawings()")
+
+    def _install_stream_listener(self, handler_name: str, debounce_ms: int):
+        chart_salt = self.id[self.id.index('.')+1:]
+        self.run_script(f'''
+            if ({self.id}._streamRangeHandler{chart_salt}) {{
+                {self.id}.chart.timeScale().unsubscribeVisibleTimeRangeChange({self.id}._streamRangeHandler{chart_salt})
+            }}
+            if ({self.id}._streamRangeTimer{chart_salt}) clearTimeout({self.id}._streamRangeTimer{chart_salt})
+
+            {self.id}._streamRangeHandler{chart_salt} = (range) => {{
+                if (!range) return
+                if (typeof window.callbackFunction !== "function") return
+                if ({self.id}._streamRangeTimer{chart_salt}) clearTimeout({self.id}._streamRangeTimer{chart_salt})
+                {self.id}._streamRangeTimer{chart_salt} = setTimeout(() => {{
+                    window.callbackFunction("{handler_name}_~_" + range.from + ";;;" + range.to)
+                }}, {debounce_ms})
+            }}
+            {self.id}.chart.timeScale().subscribeVisibleTimeRangeChange({self.id}._streamRangeHandler{chart_salt})
+        ''')
+
+    def stop_stream(self):
+        controller = getattr(self, '_stream_controller', None)
+        if controller:
+            controller['enabled'] = False
+            handler_name = controller.get('handler_name')
+            source = controller.get('source')
+            if source is not None and hasattr(source, 'close'):
+                try:
+                    source.close()
+                except Exception:
+                    pass
+            if handler_name in self.win.handlers:
+                del self.win.handlers[handler_name]
+            chart_salt = self.id[self.id.index('.')+1:]
+            self.run_script(f'''
+                if ({self.id}._streamRangeHandler{chart_salt}) {{
+                    {self.id}.chart.timeScale().unsubscribeVisibleTimeRangeChange({self.id}._streamRangeHandler{chart_salt})
+                    {self.id}._streamRangeHandler{chart_salt} = null
+                }}
+                if ({self.id}._streamRangeTimer{chart_salt}) {{
+                    clearTimeout({self.id}._streamRangeTimer{chart_salt})
+                    {self.id}._streamRangeTimer{chart_salt} = null
+                }}
+            ''')
+            self._stream_controller = None
+
+    def set_stream(
+        self,
+        source: Union[pd.DataFrame, StreamingSource],
+        indicators: Optional[dict] = None,
+        initial_bars: int = 2000,
+        chunk_bars: int = 1200,
+        prefetch_bars: int = 300,
+        max_bars: int = 20000,
+        debounce_ms: int = 80,
+        keep_drawings: bool = True,
+    ):
+        if isinstance(source, pd.DataFrame):
+            source = PandasSource(source)
+        if not isinstance(source, StreamingSource):
+            raise TypeError('source must be a pandas.DataFrame or StreamingSource implementation.')
+        if initial_bars <= 0 or chunk_bars <= 0 or prefetch_bars < 0 or max_bars <= 0:
+            raise ValueError('initial_bars/chunk_bars/max_bars must be > 0 and prefetch_bars must be >= 0.')
+
+        self.stop_stream()
+
+        config = StreamConfig(
+            initial_bars=initial_bars,
+            chunk_bars=chunk_bars,
+            prefetch_bars=prefetch_bars,
+            max_bars=max_bars,
+            debounce_ms=debounce_ms,
+            keep_drawings=keep_drawings,
+        )
+
+        initial_df = source.get_latest(config.initial_bars)
+        self.set(initial_df, keep_drawings=config.keep_drawings, indicators=indicators, _from_stream=True)
+
+        chart_salt = self.id[self.id.index('.')+1:]
+        handler_name = f'stream_range{chart_salt}'
+        state = {
+            'enabled': True,
+            'updating': False,
+            'source': source,
+            'indicators': indicators,
+            'config': config,
+            'handler_name': handler_name,
+            'window_df': initial_df.copy(),
+        }
+        self._stream_controller = state
+
+        def series_to_seconds(series: pd.Series):
+            if pd.api.types.is_datetime64_any_dtype(series):
+                return (series.astype('int64') // 10 ** 9).astype(float)
+            if pd.api.types.is_numeric_dtype(series):
+                return series.astype(float)
+            return pd.to_datetime(series).astype('int64') // 10 ** 9
+
+        def on_stream_range(from_time, to_time):
+            if not state['enabled'] or state['updating']:
+                return
+            try:
+                from_ts = float(from_time)
+                to_ts = float(to_time)
+            except (TypeError, ValueError):
+                return
+
+            loaded = state['window_df']
+            if loaded.empty or 'time' not in loaded:
+                return
+
+            loaded_seconds = series_to_seconds(loaded['time'])
+            loaded_min = float(loaded_seconds.iloc[0])
+            loaded_max = float(loaded_seconds.iloc[-1])
+            threshold = max(self._interval, self._interval * config.prefetch_bars)
+
+            fetch_left = (from_ts - loaded_min) <= threshold
+            fetch_right = (loaded_max - to_ts) <= threshold
+            if not fetch_left and not fetch_right:
+                return
+
+            frames = []
+            if fetch_left:
+                left_df = source.get_before(loaded_min, config.chunk_bars)
+                if not left_df.empty:
+                    frames.append(left_df)
+
+            frames.append(loaded)
+
+            if fetch_right:
+                right_df = source.get_after(loaded_max, config.chunk_bars)
+                if not right_df.empty:
+                    frames.append(right_df)
+
+            if len(frames) == 1:
+                return
+
+            merged = pd.concat(frames, ignore_index=True)
+            merged = merged.sort_values('time').drop_duplicates(subset=['time'], keep='last').reset_index(drop=True)
+            if len(merged) > config.max_bars:
+                if fetch_left and not fetch_right:
+                    merged = merged.iloc[-config.max_bars:].reset_index(drop=True)
+                elif fetch_right and not fetch_left:
+                    merged = merged.iloc[:config.max_bars].reset_index(drop=True)
+                else:
+                    center = (from_ts + to_ts) / 2
+                    merged_seconds = series_to_seconds(merged['time'])
+                    center_pos = merged_seconds.sub(center).abs().idxmin()
+                    start = max(0, int(center_pos) - (config.max_bars // 2))
+                    end = min(len(merged), start + config.max_bars)
+                    start = max(0, end - config.max_bars)
+                    merged = merged.iloc[start:end].reset_index(drop=True)
+
+            state['updating'] = True
+            try:
+                state['window_df'] = merged.copy()
+                self.set(merged, keep_drawings=True, indicators=state['indicators'], _from_stream=True)
+            finally:
+                state['updating'] = False
+
+        self.win.handlers[handler_name] = on_stream_range
+        self._install_stream_listener(handler_name, config.debounce_ms)
+        return self
 
     def update(self, series: pd.Series, _from_tick=False):
         """
@@ -696,6 +1291,11 @@ class AbstractChart(Candlestick, Pane):
         Pane.__init__(self, window)
 
         self._lines = []
+        self._indicator_series: Dict[str, Dict[str, Any]] = {}
+        self._indicator_panes: Dict[str, 'AbstractChart'] = {}
+        self._auto_indicator_pane_keys: List[str] = []
+        self._stream_controller: Optional[dict] = None
+        self._engine_artifact_dirs: List[str] = []
         self._scale_candles_only = scale_candles_only
         self._width = width
         self._height = height
@@ -953,6 +1553,7 @@ class AbstractChart(Candlestick, Pane):
     def create_subchart(self, position: FLOAT = 'left', width: float = 0.5, height: float = 0.5,
                         sync: Optional[Union[str, bool]] = None, scale_candles_only: bool = False,
                         sync_crosshairs_only: bool = False,
+                        sync_mode: Literal['main', 'active'] = 'main',
                         toolbox: bool = False) -> 'AbstractChart':
         if sync is True:
             sync = self.id

@@ -148,6 +148,70 @@ if __name__ == '__main__':
 ![line indicators image](https://raw.githubusercontent.com/louisnw01/lightweight-charts-python/main/examples/4_line_indicators/line_indicators.png)
 ___
 
+### 4b. Single DataFrame with Main and Subplot Indicators:
+
+```python
+import pandas as pd
+from lightweight_charts import Chart
+
+
+if __name__ == '__main__':
+    chart = Chart()
+    chart.legend(visible=True, lines=True)
+
+    # Columns: time | open | high | low | close | volume | rsi | atr | sma
+    df = pd.read_csv('ohlcv_with_indicators.csv')
+
+    chart.set(
+        df,
+        indicators={
+            'rsi': {'pane': 'osc', 'type': 'histogram'},
+            'atr': {'pane': 'osc', 'type': 'line'},
+            'sma': ['main', 'line'],
+        }
+    )
+
+    chart.show(block=True)
+```
+___
+
+### 4c. Internal Streaming Window (Large Datasets, Invisible DuckDB Engine):
+
+```python
+import pandas as pd
+from lightweight_charts import JupyterChart
+
+
+if __name__ == '__main__':
+    chart = JupyterChart(height=550)
+    df = pd.read_parquet('huge_ohlcv_with_indicators.parquet')
+
+    chart.set(
+        df,
+        engine='duckdb',  # materializes internal parquet/db and streams by visible range
+        indicators={
+            'rsi': {'pane': 'osc', 'type': 'line'},
+            'atr': {'pane': 'osc', 'type': 'histogram'},
+            'sma': ['main', 'line'],
+        },
+        engine_options={
+            'initial_bars': 3000,
+            'chunk_bars': 1500,
+            'prefetch_bars': 300,
+            'max_bars': 20000,
+        },
+    )
+
+    chart.load()
+
+    # Clears all chart data and removes internal parquet/db artifacts created by engine='duckdb'
+    chart.reset()
+```
+
+`Note`: dynamic fetch/expurge while panning requires a callback-enabled backend (`Chart`, `QtChart`, `WxChart`).
+In `JupyterChart`, `engine='duckdb'` loads the latest window with the same API.
+___
+
 ### 5. Styling:
 
 ```python
